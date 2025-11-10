@@ -2,6 +2,7 @@ import streamlit as st
 import xml.etree.ElementTree as ET
 from io import BytesIO
 from copy import deepcopy
+import math
 
 st.set_page_config(page_title="CVAT Track Merger", layout="wide")
 
@@ -9,48 +10,29 @@ st.title("CVAT Video XML Track Merger")
 
 st.markdown(
     """
-Upload a **CVAT Video XML** (with jobs/segments) and:
+Upload a **CVAT Video XML** (with segments/jobs). This app:
 
-1. If each job contains a *single track*, automatically merge them into one continuous track.
-2. If some jobs contain **multiple tracks**, select which tracks to merge into one.
-
-Then download the updated CVAT video XML with a single merged track.
+1. Detects jobs/segments from `<meta>`.
+2. Analyzes tracks and their box coordinates.
+3. **Suggests** one continuous track across segments:
+   - Single-track segments → auto-selected.
+   - Multi-track segments → picks the closest continuation by coordinates (with label/attribute checks).
+4. Lets you adjust selections per segment.
+5. Exports a new CVAT Video XML with one merged track (removing the originals used for the merge).
 """
 )
 
 uploaded_file = st.file_uploader("Upload CVAT video XML", type=["xml"])
 
-# Session state
-if "parsed" not in st.session_state:
-    st.session_state.parsed = None
-if "segments" not in st.session_state:
-    st.session_state.segments = []
-if "job_tracks" not in st.session_state:
-    st.session_state.job_tracks = {}
-if "selected_tracks" not in st.session_state:
-    st.session_state.selected_tracks = {}
-if "auto_merge_possible" not in st.session_state:
-    st.session_state.auto_merge_possible = False
-
+# ===== Helpers =====
 
 def parse_segments(root):
-    """
-    Extract job/segment definitions from the CVAT meta.
-
-    Supports:
-    - <meta><task><segments><segment>...</segment></segments></task>
-    - <meta><job>...</job> (single-job export)
-
-    Returns:
-        list of {id, start, stop, source}
-    """
     segments = []
-
     meta = root.find("meta")
     if meta is None:
         return segments
 
-    # Case 1: Task with segments (common multi-job video export)
+    # Multi-segment task
     task = meta.find("task")
     if task is not None:
         seg_container = task.find("segments")
@@ -60,146 +42,257 @@ def parse_segments(root):
                 start = seg.findtext("start")
                 stop = seg.findtext("stop")
                 if start is not None and stop is not None:
-                    segments.append(
-                        {
-                            "id": seg_id if seg_id is not None else str(len(segments)),
-                            "start": int(start),
-                            "stop": int(stop),
-                            "source": "segment",
-                        }
-                    )
+                    segments.append({
+                        "id": seg_id if seg_id is not None else str(len(segments)),
+                        "start": int(start),
+                        "stop": int(stop),
+                        "source": "segment",
+                    })
 
-    # Case 2: Simple job export
+    # Single job export fallback
     job = meta.find("job")
-    if job is not None:
+    if job is not None and not segments:
         start = job.findtext("start_frame")
         stop = job.findtext("stop_frame")
         if start is not None and stop is not None:
-            segments.append(
-                {
-                    "id": job.findtext("id") or "0",
-                    "start": int(start),
-                    "stop": int(stop),
-                    "source": "job",
-                }
-            )
+            segments.append({
+                "id": job.findtext("id") or "0",
+                "start": int(start),
+                "stop": int(stop),
+                "source": "job",
+            })
 
     return segments
 
 
 def collect_job_tracks(root, segments):
     """
-    For each segment, find which tracks have boxes in its frame range.
-
-    Returns:
-        job_tracks: {
-            seg_id: {
-                track_id: {
-                    'label': str,
-                    'attributes': {name: value},
-                    'frames': [frame_numbers...]
-                }, ...
-            }, ...
-        }
+    Map which tracks appear in each segment's frame range.
     """
     job_tracks = {seg["id"]: {} for seg in segments}
 
     for track in root.findall("track"):
-        track_id = track.get("id")
+        tid = track.get("id")
         label = track.get("label", "")
 
-        # Track-level attributes
         attrs = {}
-        for attr in track.findall("attribute"):
-            name = attr.get("name")
-            if name is not None:
-                attrs[name] = (attr.text or "").strip()
+        for a in track.findall("attribute"):
+            name = a.get("name")
+            if name:
+                attrs[name] = (a.text or "").strip()
 
-        # Check all boxes of this track
         for box in track.findall("box"):
             frame = int(box.get("frame", 0))
             for seg in segments:
                 if seg["start"] <= frame <= seg["stop"]:
                     seg_tracks = job_tracks.setdefault(seg["id"], {})
-                    entry = seg_tracks.setdefault(
-                        track_id,
+                    info = seg_tracks.setdefault(
+                        tid,
                         {"label": label, "attributes": attrs, "frames": []},
                     )
-                    entry["frames"].append(frame)
+                    info["frames"].append(frame)
 
     return job_tracks
 
 
-def can_auto_merge(job_tracks):
+def get_track_boxes_by_frame(track):
     """
-    Auto-merge is allowed only if:
-    - Every segment that has any tracks has EXACTLY ONE candidate track.
+    Return sorted list of (frame, cx, cy) for all boxes.
     """
-    has_any = False
-    for _, tracks in job_tracks.items():
-        if tracks:
-            has_any = True
-            if len(tracks) != 1:
-                return False
-    return has_any
+    boxes = []
+    for box in track.findall("box"):
+        try:
+            frame = int(box.get("frame", 0))
+            xtl = float(box.get("xtl", 0))
+            ytl = float(box.get("ytl", 0))
+            xbr = float(box.get("xbr", 0))
+            ybr = float(box.get("ybr", 0))
+        except ValueError:
+            continue
+        cx = (xtl + xbr) / 2.0
+        cy = (ytl + ybr) / 2.0
+        boxes.append((frame, cx, cy))
+    boxes.sort(key=lambda x: x[0])
+    return boxes
 
 
-def build_selection_ui(job_tracks):
+def build_track_info(root, segments, job_tracks):
     """
-    Build the manual selection UI.
-
-    Returns:
-        selected: {seg_id: [track_ids_to_merge]}
+    Enrich job_tracks with geometry and frame stats for continuity scoring.
     """
-    st.subheader("Select tracks to merge (Manual Mode)")
-    st.markdown(
-        "For each job/segment, choose which track(s) belong to the same physical object and should be merged."
-    )
+    track_map = {t.get("id"): t for t in root.findall("track")}
+    info = {seg["id"]: {} for seg in segments}
 
+    for seg in segments:
+        sid = seg["id"]
+        for tid, meta in job_tracks.get(sid, {}).items():
+            t = track_map.get(tid)
+            if t is None:
+                continue
+            boxes = get_track_boxes_by_frame(t)
+            if not boxes:
+                continue
+            frames = [b[0] for b in boxes]
+            info[sid][tid] = {
+                "label": meta["label"],
+                "attributes": meta["attributes"],
+                "start_frame": min(frames),
+                "end_frame": max(frames),
+                "first_box": boxes[0],
+                "last_box": boxes[-1],
+            }
+    return info
+
+
+def attr_signature(attrs):
+    return tuple(sorted(attrs.items()))
+
+
+def euclidean(p1, p2):
+    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+
+
+def suggest_track_chain(segments, track_info):
+    """
+    Suggest exactly ONE track per segment that forms a continuous object.
+
+    Strategy:
+    - If only one track in segment -> select it.
+    - If multiple:
+        * If there is a previous chosen track:
+            - prefer same label
+            - prefer same attributes
+            - minimize distance between:
+                prev segment last_box center -> candidate first_box center
+        * Otherwise fallback = longest track in that segment.
+    """
+    suggestion = {}
+    prev_tid = None
+    prev_sid = None
+
+    ordered_segments = sorted(segments, key=lambda s: s["start"])
+
+    for seg in ordered_segments:
+        sid = seg["id"]
+        candidates = track_info.get(sid, {})
+        if not candidates:
+            continue
+
+        # Single option
+        if len(candidates) == 1:
+            tid = next(iter(candidates.keys()))
+            suggestion[sid] = [tid]
+            prev_tid, prev_sid = tid, sid
+            continue
+
+        # First ambiguous segment with no history: choose longest
+        if prev_tid is None or prev_sid is None:
+            best_tid = max(
+                candidates.items(),
+                key=lambda kv: kv[1]["end_frame"] - kv[1]["start_frame"]
+            )[0]
+            suggestion[sid] = [best_tid]
+            prev_tid, prev_sid = best_tid, sid
+            continue
+
+        prev_info = track_info.get(prev_sid, {}).get(prev_tid)
+        if not prev_info:
+            best_tid = max(
+                candidates.items(),
+                key=lambda kv: kv[1]["end_frame"] - kv[1]["start_frame"]
+            )[0]
+            suggestion[sid] = [best_tid]
+            prev_tid, prev_sid = best_tid, sid
+            continue
+
+        prev_label = prev_info["label"]
+        prev_attr_sig = attr_signature(prev_info["attributes"])
+        prev_center = (prev_info["last_box"][1], prev_info["last_box"][2])
+
+        best_tid = None
+        best_score = float("inf")
+
+        # Score each candidate
+        for tid, ci in candidates.items():
+            label = ci["label"]
+            cand_center = (ci["first_box"][1], ci["first_box"][2])
+            score = 0.0
+
+            # Require same label if possible
+            if label != prev_label:
+                score += 10_000  # big penalty
+
+            # Attribute mismatch penalty
+            if attr_signature(ci["attributes"]) != prev_attr_sig:
+                score += 1_000
+
+            # Coordinate distance
+            score += euclidean(prev_center, cand_center)
+
+            if score < best_score:
+                best_score = score
+                best_tid = tid
+
+        # Fallback: if everything penalized, still pick min-score or longest
+        if best_tid is None:
+            best_tid = max(
+                candidates.items(),
+                key=lambda kv: kv[1]["end_frame"] - kv[1]["start_frame"]
+            )[0]
+
+        suggestion[sid] = [best_tid]
+        prev_tid, prev_sid = best_tid, sid
+
+    return suggestion
+
+
+def build_selection_ui_with_suggestions(segments, job_tracks, track_info, auto_suggestion):
+    st.subheader("Track selection per segment (you can override suggestions)")
     selected = {}
-    for seg_id, tracks in job_tracks.items():
+
+    for seg in sorted(segments, key=lambda s: s["start"]):
+        sid = seg["id"]
+        tracks = job_tracks.get(sid, {})
         if not tracks:
             continue
 
-        st.markdown(f"**Job / Segment {seg_id}**")
+        st.markdown(f"**Segment / Job {sid}**")
 
         options = []
         option_to_tid = {}
+        default = []
 
-        for tid, info in tracks.items():
-            attr_str = ", ".join(
-                f"{k}={v}" for k, v in info["attributes"].items()
-            ) or "no attributes"
-            frame_range = f"{min(info['frames'])}-{max(info['frames'])}" if info["frames"] else "n/a"
-            desc = f"Track {tid} | Label: {info['label']} | {attr_str} | Frames: {frame_range}"
+        for tid, meta in tracks.items():
+            ti = track_info.get(sid, {}).get(tid, {})
+            attr_str = ", ".join(f"{k}={v}" for k, v in meta["attributes"].items()) or "no attributes"
+            sf, ef = ti.get("start_frame"), ti.get("end_frame")
+            fr_str = f"{sf}-{ef}" if sf is not None and ef is not None else "n/a"
+            desc = f"Track {tid} | Label: {meta['label']} | {attr_str} | Frames: {fr_str}"
+
+            if auto_suggestion.get(sid) == [tid]:
+                desc += "  ⟵ suggested"
+                default = [desc]
+
             options.append(desc)
             option_to_tid[desc] = tid
 
         chosen = st.multiselect(
-            f"Tracks in segment {seg_id}",
+            f"Choose track(s) in segment {sid} to belong to the SAME object chain:",
             options,
-            default=options[0:1],
-            key=f"seg_{seg_id}",
+            default=default or options[0:1],
+            key=f"seg_{sid}",
         )
 
-        selected[seg_id] = [option_to_tid[c] for c in chosen]
+        selected[sid] = [option_to_tid[c] for c in chosen]
 
     return selected
 
 
 def merge_tracks(root, segments, selected_tracks):
     """
-    Merge the chosen tracks into a single new track.
-
-    Rules:
-    - Process segments in ascending start frame.
-    - For each segment, take boxes from the selected track IDs
-      that fall within that segment's frame span.
-    - Use label/group/source + attributes from the first contributing track.
-    - Remove all original tracks that contributed.
-    - Append one new merged <track> at the end.
+    Build one merged <track> from selected tracks across segments.
     """
-    # Allocate new track id
+    # Find free ID
     existing_ids = []
     for t in root.findall("track"):
         try:
@@ -217,24 +310,21 @@ def merge_tracks(root, segments, selected_tracks):
     base_group = None
     base_source = None
     base_attrs = []
+    used_track_ids = set()
 
-    all_selected_track_ids = set()
-
-    # Collect boxes in chronological order of segments
+    # Collect boxes in segment order
     for seg in sorted(segments, key=lambda s: s["start"]):
-        seg_id = seg["id"]
-        ids_to_merge = selected_tracks.get(seg_id, [])
-        if not ids_to_merge:
+        sid = seg["id"]
+        tids = selected_tracks.get(sid, [])
+        if not tids:
             continue
 
-        for tid in ids_to_merge:
+        for tid in tids:
             orig = track_map.get(tid)
             if orig is None:
                 continue
+            used_track_ids.add(tid)
 
-            all_selected_track_ids.add(tid)
-
-            # Initialize merged track properties from first valid track
             if base_label is None:
                 base_label = orig.get("label", "")
                 base_group = orig.get("group", "0")
@@ -242,17 +332,16 @@ def merge_tracks(root, segments, selected_tracks):
                 for a in orig.findall("attribute"):
                     base_attrs.append(deepcopy(a))
 
-            # Add boxes in this segment range
+            # Add boxes that fall inside this segment
             for box in orig.findall("box"):
                 frame = int(box.get("frame", 0))
                 if seg["start"] <= frame <= seg["stop"]:
                     new_track.append(deepcopy(box))
 
-    # If no boxes collected -> nothing to merge
     if len(new_track.findall("box")) == 0:
         return None
 
-    # Set merged track properties
+    # Set merged properties
     if base_label is not None:
         new_track.set("label", base_label)
     if base_group is not None:
@@ -260,27 +349,24 @@ def merge_tracks(root, segments, selected_tracks):
     if base_source is not None:
         new_track.set("source", base_source)
 
-    # Add attributes at top of track
     for a in base_attrs:
         new_track.insert(0, a)
 
-    # Sort boxes by frame index
-    boxes = new_track.findall("box")
+    # Sort boxes by frame
+    boxes = list(new_track.findall("box"))
     boxes_sorted = sorted(boxes, key=lambda b: int(b.get("frame", 0)))
     for b in boxes:
         new_track.remove(b)
     for b in boxes_sorted:
         new_track.append(b)
 
-    # Remove all original contributing tracks
-    for tid in all_selected_track_ids:
+    # Drop original tracks that contributed
+    for tid in used_track_ids:
         t = track_map.get(tid)
         if t is not None and t in root:
             root.remove(t)
 
-    # Append the merged track
     root.append(new_track)
-
     return root
 
 
@@ -288,8 +374,8 @@ def export_xml(root):
     xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     return BytesIO(xml_bytes)
 
+# ===== Main flow =====
 
-# === Main logic ===
 if uploaded_file is not None:
     try:
         tree = ET.parse(uploaded_file)
@@ -298,102 +384,45 @@ if uploaded_file is not None:
         st.error(f"Failed to parse XML: {e}")
     else:
         segments = parse_segments(root)
-
         if not segments:
-            st.warning(
-                "No jobs/segments found under <meta>. "
-                "This tool expects CVAT **video** XML with segments or job frame ranges."
-            )
+            st.warning("No segments/jobs found in <meta>. Make sure this is a CVAT **video** XML with segments or job frame ranges.")
         else:
             job_tracks = collect_job_tracks(root, segments)
+            track_info = build_track_info(root, segments, job_tracks)
+            auto_suggestion = suggest_track_chain(segments, track_info)
 
-            st.session_state.parsed = root
-            st.session_state.segments = segments
-            st.session_state.job_tracks = job_tracks
-
-            # Display summary
             st.subheader("Detected segments and tracks")
-            for seg in segments:
-                seg_id = seg["id"]
-                tracks = job_tracks.get(seg_id, {})
+
+            for seg in sorted(segments, key=lambda s: s["start"]):
+                sid = seg["id"]
+                tracks = job_tracks.get(sid, {})
                 if tracks:
                     st.write(
-                        f"Segment {seg_id}: frames {seg['start']}–{seg['stop']} | "
+                        f"Segment {sid}: frames {seg['start']}–{seg['stop']} | "
                         f"{len(tracks)} track(s): {', '.join(tracks.keys())}"
                     )
                 else:
                     st.write(
-                        f"Segment {seg_id}: frames {seg['start']}–{seg['stop']} | no tracks"
+                        f"Segment {sid}: frames {seg['start']}–{seg['stop']} | no tracks"
                     )
 
-            auto_possible = can_auto_merge(job_tracks)
-            st.session_state.auto_merge_possible = auto_possible
+            st.markdown("---")
 
-            merge_mode = st.radio(
-                "Merge mode",
-                (
-                    "Auto: merge single-track jobs into one track",
-                    "Manual: choose tracks per job to merge",
-                ),
+            # Build selection UI with coordinate-based suggested chain
+            selected_tracks = build_selection_ui_with_suggestions(
+                segments, job_tracks, track_info, auto_suggestion
             )
 
-            # AUTO MODE
-            if merge_mode.startswith("Auto"):
-                if not auto_possible:
-                    st.warning(
-                        "Auto merge is not possible: at least one segment has zero or multiple tracks.\n"
-                        "Switch to manual mode and choose the correct track per segment."
-                    )
+            if st.button("Generate merged XML", type="primary"):
+                merged_root = merge_tracks(deepcopy(root), segments, selected_tracks)
+                if merged_root is None:
+                    st.error("No valid merged track built. Check selections.")
                 else:
-                    # Build mapping: for each non-empty segment, use its single track
-                    selected_tracks = {}
-                    for seg_id, tracks in job_tracks.items():
-                        if len(tracks) == 1:
-                            (tid,) = tracks.keys()
-                            selected_tracks[seg_id] = [tid]
-
-                    st.session_state.selected_tracks = selected_tracks
-
-                    if st.button("Generate merged XML", type="primary"):
-                        merged_root = merge_tracks(
-                            deepcopy(st.session_state.parsed),
-                            st.session_state.segments,
-                            st.session_state.selected_tracks,
-                        )
-                        if merged_root is None:
-                            st.error("No boxes found to merge. Check your XML content.")
-                        else:
-                            bio = export_xml(merged_root)
-                            st.success("Merged track created successfully.")
-                            st.download_button(
-                                "Download merged CVAT video XML",
-                                data=bio,
-                                file_name="merged_tracks.xml",
-                                mime="application/xml",
-                            )
-
-            # MANUAL MODE
-            else:
-                selected_tracks = build_selection_ui(job_tracks)
-                st.session_state.selected_tracks = selected_tracks
-
-                if st.button("Generate merged XML from selected tracks", type="primary"):
-                    merged_root = merge_tracks(
-                        deepcopy(st.session_state.parsed),
-                        st.session_state.segments,
-                        st.session_state.selected_tracks,
+                    bio = export_xml(merged_root)
+                    st.success("Merged track created. Download below.")
+                    st.download_button(
+                        "Download merged CVAT video XML",
+                        data=bio,
+                        file_name="merged_tracks.xml",
+                        mime="application/xml",
                     )
-                    if merged_root is None:
-                        st.error(
-                            "No valid selections or no boxes found in chosen tracks. "
-                            "Make sure you picked the correct track(s) per segment."
-                        )
-                    else:
-                        bio = export_xml(merged_root)
-                        st.success("Merged track created successfully from selected tracks.")
-                        st.download_button(
-                            "Download merged CVAT video XML",
-                            data=bio,
-                            file_name="merged_tracks.xml",
-                            mime="application/xml",
-                        )
