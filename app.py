@@ -19,9 +19,12 @@ Upload one of:
 - **CVAT XML** (video track XML) → merge across segments/jobs, or merge “single-frame tracks” into one continuous track.
 - **CVAT XML** (image/shapes XML) → convert per-image shapes into ONE track across the whole task.
 - **CVAT ZIP** containing XML(s) → same as above (you choose which XML inside).
-- **Datumaro JSON** or **Datumaro ZIP** (2D or 3D including `cuboid_3d`) → merge by label + track identity.
+- **Datumaro JSON** or **Datumaro ZIP** (2D or 3D including `cuboid_3d`) → merge by label + track identity, and **auto-convert untracked shapes to a new track_id**.
 
-**Important:** In Datumaro, annotation `"id"` is a unique record id; track identity is `attributes.track_id` (and commonly `group`).
+✅ New requested feature:
+- Detect Datumaro annotations of a chosen label **without** `attributes.track_id`
+- Assign them the **next available track_id** (per dataset), plus `group` and optional `instance_id`
+- This won’t interfere with existing tracks, so you can reupload to CVAT safely.
 """
 )
 
@@ -50,7 +53,6 @@ def _next_track_id_xml(root: ET.Element) -> int:
     return (max(ids) + 1) if ids else 0
 
 def _safe_read_text(path: Path) -> str:
-    # CVAT exports sometimes contain UTF-8, sometimes UTF-8 with BOM; try both
     try:
         return path.read_text(encoding="utf-8")
     except Exception:
@@ -480,6 +482,7 @@ def merge_single_frame_tracks_into_one_track_xml(
 
     return root, len(tracks), f"Merged {len(tracks)} tracks → 1 track with {len(chosen)} frames."
 
+
 # ============================================================
 # CVAT IMAGE/SHAPES XML -> ONE TRACK conversion
 # ============================================================
@@ -567,12 +570,95 @@ def shapes_to_single_track_xml(
 
 
 # ============================================================
-# Datumaro helpers (JSON + ZIP)
+# Datumaro helpers (JSON + ZIP) + NEW FEATURE: auto-assign track_id
 # ============================================================
 
 def datumaro_label_map(data: dict):
     labels = data["categories"]["label"].get("labels", [])
     return {i: lbl.get("name", f"label_{i}") for i, lbl in enumerate(labels)}
+
+def datumaro_label_ids_for_name(data: dict, label_name: str):
+    labels = data["categories"]["label"].get("labels", [])
+    out = []
+    for i, lbl in enumerate(labels):
+        if lbl.get("name") == label_name:
+            out.append(i)
+    return set(out)
+
+def datumaro_collect_track_ids(data: dict):
+    tids = set()
+    for item in data.get("items", []):
+        for ann in item.get("annotations", []):
+            attrs = ann.get("attributes", {}) or {}
+            if "track_id" in attrs:
+                try:
+                    tids.add(int(attrs["track_id"]))
+                except Exception:
+                    pass
+    return tids
+
+def datumaro_next_available_track_id(data: dict) -> int:
+    tids = datumaro_collect_track_ids(data)
+    return (max(tids) + 1) if tids else 0
+
+def datumaro_count_untracked_for_label(data: dict, label_name: str):
+    label_ids = datumaro_label_ids_for_name(data, label_name)
+    by_type = defaultdict(int)
+    total = 0
+    for item in data.get("items", []):
+        for ann in item.get("annotations", []):
+            if ann.get("label_id") not in label_ids:
+                continue
+            attrs = ann.get("attributes", {}) or {}
+            if "track_id" not in attrs:
+                total += 1
+                by_type[ann.get("type", "unknown")] += 1
+    return total, dict(by_type)
+
+def datumaro_assign_untracked_shapes_to_new_track(
+    data: dict,
+    label_name: str,
+    new_track_id: int = None,
+    set_group: bool = True,
+    add_instance_id: bool = True,
+    only_types=None,  # optional set/list of types to include
+):
+    """
+    NEW FEATURE:
+    - For selected label_name, find annotations WITHOUT attributes.track_id
+    - Assign them track_id = next available (or provided)
+    - Set group = track_id (optional)
+    - Add attributes.instance_id = track_id (optional)
+    - Can filter by types, e.g. only cuboid_3d
+    """
+    if new_track_id is None:
+        new_track_id = datumaro_next_available_track_id(data)
+
+    label_ids = datumaro_label_ids_for_name(data, label_name)
+    only_types = set(only_types) if only_types else None
+
+    changed = 0
+    for item in data.get("items", []):
+        for ann in item.get("annotations", []):
+            if ann.get("label_id") not in label_ids:
+                continue
+            if only_types and ann.get("type", "unknown") not in only_types:
+                continue
+            attrs = ann.get("attributes", {}) or {}
+            if "track_id" in attrs:
+                continue
+
+            attrs["track_id"] = int(new_track_id)
+            if add_instance_id:
+                attrs["instance_id"] = int(new_track_id)
+            ann["attributes"] = attrs
+
+            if set_group:
+                ann["group"] = int(new_track_id)
+
+            changed += 1
+
+    return data, int(new_track_id), changed
 
 def collect_datumaro_tracks(data: dict):
     label_map = datumaro_label_map(data)
@@ -646,14 +732,12 @@ def datumaro_merge_all_shapes_to_one_track(
     add_instance_id: bool = True,
     reindex_annotation_ids: bool = False,
 ):
-    labels = data["categories"]["label"].get("labels", [])
-    label_map = {i: lbl.get("name", f"label_{i}") for i, lbl in enumerate(labels)}
-    label_ids_for_name = {lid for lid, nm in label_map.items() if nm == label_name}
+    label_ids = datumaro_label_ids_for_name(data, label_name)
 
     changed = 0
     for item in data.get("items", []):
         for ann in item.get("annotations", []):
-            if ann.get("label_id") not in label_ids_for_name:
+            if ann.get("label_id") not in label_ids:
                 continue
             attrs = ann.get("attributes", {}) or {}
 
@@ -685,10 +769,10 @@ def datumaro_merge_all_shapes_to_one_track(
 if uploaded is None:
     st.stop()
 
-tmpdir = None  # for zip
-zip_selected_path = None  # if user picks an xml/json inside zip
+tmpdir = None
+zip_selected_path = None
 zip_mode = False
-input_kind = None  # "cvat_xml" / "datumaro" / None
+input_kind = None
 
 root_xml = None
 datumaro_data = None
@@ -701,13 +785,9 @@ try:
         raw = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
         tmpdir = _extract_zip_to_tmp(raw)
 
-        # Try Datumaro first
         dm_json_path, dm_data = _find_datumaro_json_in_dir(tmpdir)
-
-        # Find XML files
         xml_files = _find_xml_files_in_dir(tmpdir)
 
-        # Let user choose which asset to use if ambiguous
         choices = []
         if dm_json_path is not None:
             choices.append(("Datumaro (auto-found JSON)", dm_json_path))
@@ -718,9 +798,7 @@ try:
             st.error("ZIP extracted, but found no Datumaro JSON and no XML files.")
             st.stop()
 
-        label_choices = [c[0] for c in choices]
-        pick = st.selectbox("ZIP contains multiple candidates — choose what to load", label_choices)
-
+        pick = st.selectbox("ZIP contains multiple candidates — choose what to load", [c[0] for c in choices])
         chosen_path = dict(choices)[pick]
         zip_selected_path = chosen_path
 
@@ -729,13 +807,7 @@ try:
             datumaro_data = dm_data
         else:
             input_kind = "cvat_xml"
-            # parse xml from file path
-            try:
-                xml_text = _safe_read_text(chosen_path)
-                root_xml = ET.fromstring(xml_text)
-            except Exception as e:
-                st.error(f"Failed to parse selected XML inside ZIP: {e}")
-                st.stop()
+            root_xml = ET.fromstring(_safe_read_text(chosen_path))
 
     elif fname.endswith(".xml"):
         input_kind = "cvat_xml"
@@ -760,7 +832,7 @@ except Exception as e:
 
 
 # ============================================================
-# CVAT XML UI (track XML + shapes XML + special per-frame tracks merge)
+# CVAT XML UI
 # ============================================================
 
 if input_kind == "cvat_xml":
@@ -783,7 +855,7 @@ if input_kind == "cvat_xml":
         if not has_tracks:
             st.warning("This XML does not contain <track> elements.")
         else:
-            st.subheader("A) Merge selected tracks across segments/jobs into ONE track")
+            st.subheader("Merge selected tracks across segments/jobs into ONE track")
             segments = parse_segments_xml(root_xml)
             if not segments:
                 segments = fallback_single_segment_from_track_xml(root_xml)
@@ -792,12 +864,6 @@ if input_kind == "cvat_xml":
             job_tracks = collect_job_tracks_xml(root_xml, segments)
             track_info = build_track_info_xml(root_xml, segments, job_tracks)
             auto_suggestion = suggest_track_chain_xml(segments, track_info)
-
-            st.caption("Detected segments/jobs:")
-            for seg in sorted(segments, key=lambda s: s["start"]):
-                sid = seg["id"]
-                tracks = job_tracks.get(sid, {})
-                st.write(f"- Segment/Job {sid}: frames {seg['start']}–{seg['stop']} | tracks found: {len(tracks)}")
 
             selected_tracks = build_selection_ui_xml(segments, job_tracks, track_info, auto_suggestion)
 
@@ -810,27 +876,15 @@ if input_kind == "cvat_xml":
                 if merged_root is None:
                     st.error("No valid merged track built. Check selections.")
                 else:
-                    st.success("Merged track created from your selections.")
-
                     merged_xml_bytes = _export_xml_bytes(merged_root)
+                    st.success("Merged track created.")
 
                     if zip_mode and out_as_zip and tmpdir and zip_selected_path:
-                        # replace the chosen xml inside tmpdir
                         zip_selected_path.write_bytes(merged_xml_bytes)
                         out_zip = _rezip_folder_to_bytes(tmpdir)
-                        st.download_button(
-                            "Download merged ZIP",
-                            data=out_zip,
-                            file_name="merged_cvat.zip",
-                            mime="application/zip",
-                        )
+                        st.download_button("Download merged ZIP", data=out_zip, file_name="merged_cvat.zip", mime="application/zip")
                     else:
-                        st.download_button(
-                            "Download merged CVAT XML",
-                            data=merged_xml_bytes,
-                            file_name="cvat_merged_track.xml",
-                            mime="application/xml",
-                        )
+                        st.download_button("Download merged CVAT XML", data=merged_xml_bytes, file_name="cvat_merged_track.xml", mime="application/xml")
 
     with tabs[2]:
         if not has_images:
@@ -847,10 +901,9 @@ if input_kind == "cvat_xml":
                         break
 
             if not available:
-                st.warning("No supported shapes found inside <image> (box/polygon/polyline/points).")
+                st.warning("No supported shapes found inside <image>.")
             else:
                 shape_tag = st.selectbox("Shape type to convert", available)
-
                 labels = sorted({
                     n.get("label", "")
                     for img in root_xml.findall("image")
@@ -858,47 +911,33 @@ if input_kind == "cvat_xml":
                     if n.get("label", "")
                 })
 
-                if not labels:
-                    st.warning(f"No labels found for <{shape_tag}> shapes.")
-                else:
-                    label_name = st.selectbox("Label to convert into a track", labels)
-                    resolve = st.selectbox("If multiple shapes exist on the same frame, keep:", ["largest", "first"])
-                    remove_orig = st.checkbox("Remove original shapes after creating track", value=True)
+                label_name = st.selectbox("Label", labels)
+                resolve = st.selectbox("If multiple shapes exist on the same frame, keep:", ["largest", "first"])
+                remove_orig = st.checkbox("Remove original shapes after creating track", value=True)
 
-                    out_as_zip = False
-                    if zip_mode:
-                        out_as_zip = st.checkbox("Download result as ZIP (replace the selected XML inside the ZIP)", value=True, key="zip_shapes_replace")
+                out_as_zip = False
+                if zip_mode:
+                    out_as_zip = st.checkbox("Download result as ZIP (replace the selected XML inside the ZIP)", value=True, key="zip_shapes_replace")
 
-                    if st.button("Convert shapes → ONE track", type="primary"):
-                        merged_root, msg = shapes_to_single_track_xml(
-                            deepcopy(root_xml),
-                            shape_tag=shape_tag,
-                            label_name=label_name,
-                            resolve_same_frame=resolve,
-                            remove_original_shapes=remove_orig,
-                        )
-                        if merged_root is None:
-                            st.error(msg)
+                if st.button("Convert shapes → ONE track", type="primary"):
+                    merged_root, msg = shapes_to_single_track_xml(
+                        deepcopy(root_xml),
+                        shape_tag=shape_tag,
+                        label_name=label_name,
+                        resolve_same_frame=resolve,
+                        remove_original_shapes=remove_orig,
+                    )
+                    if merged_root is None:
+                        st.error(msg)
+                    else:
+                        merged_xml_bytes = _export_xml_bytes(merged_root)
+                        st.success(msg)
+                        if zip_mode and out_as_zip and tmpdir and zip_selected_path:
+                            zip_selected_path.write_bytes(merged_xml_bytes)
+                            out_zip = _rezip_folder_to_bytes(tmpdir)
+                            st.download_button("Download merged ZIP", data=out_zip, file_name="merged_cvat.zip", mime="application/zip")
                         else:
-                            st.success(msg)
-                            merged_xml_bytes = _export_xml_bytes(merged_root)
-
-                            if zip_mode and out_as_zip and tmpdir and zip_selected_path:
-                                zip_selected_path.write_bytes(merged_xml_bytes)
-                                out_zip = _rezip_folder_to_bytes(tmpdir)
-                                st.download_button(
-                                    "Download merged ZIP",
-                                    data=out_zip,
-                                    file_name="merged_cvat.zip",
-                                    mime="application/zip",
-                                )
-                            else:
-                                st.download_button(
-                                    "Download XML with new track",
-                                    data=merged_xml_bytes,
-                                    file_name=f"cvat_shapes_to_track_{shape_tag}_{label_name}.xml",
-                                    mime="application/xml",
-                                )
+                            st.download_button("Download XML", data=merged_xml_bytes, file_name="cvat_shapes_to_track.xml", mime="application/xml")
 
     with tabs[3]:
         if not has_tracks:
@@ -907,50 +946,37 @@ if input_kind == "cvat_xml":
             st.subheader("Merge “one-track-per-frame” tracks into ONE continuous track")
 
             labels = sorted({t.get("label", "") for t in root_xml.findall("track") if t.get("label", "")})
-            if not labels:
-                st.warning("No labels found in tracks.")
-            else:
-                label_name = st.selectbox("Label to merge into one continuous track", labels, key="sf_label")
-                resolve = st.selectbox("If multiple boxes exist on same frame, keep:", ["largest", "first"], key="sf_resolve")
-                keep_attrs = st.selectbox("Track attributes to keep", ["first", "none"], key="sf_keep_attrs")
+            label_name = st.selectbox("Label", labels, key="sf_label")
+            resolve = st.selectbox("If multiple boxes exist on same frame, keep:", ["largest", "first"], key="sf_resolve")
+            keep_attrs = st.selectbox("Track attributes to keep", ["first", "none"], key="sf_keep_attrs")
 
-                out_as_zip = False
-                if zip_mode:
-                    out_as_zip = st.checkbox("Download result as ZIP (replace the selected XML inside the ZIP)", value=True, key="zip_sf_replace")
+            out_as_zip = False
+            if zip_mode:
+                out_as_zip = st.checkbox("Download result as ZIP (replace the selected XML inside the ZIP)", value=True, key="zip_sf_replace")
 
-                if st.button("Merge per-frame tracks → ONE track", type="primary", key="sf_btn"):
-                    merged_root, count, msg = merge_single_frame_tracks_into_one_track_xml(
-                        deepcopy(root_xml),
-                        label_name=label_name,
-                        shape_tag="box",
-                        resolve_same_frame=resolve,
-                        keep_attributes_from=keep_attrs,
-                    )
-                    if merged_root is None:
-                        st.error(msg)
+            if st.button("Merge per-frame tracks → ONE track", type="primary", key="sf_btn"):
+                merged_root, count, msg = merge_single_frame_tracks_into_one_track_xml(
+                    deepcopy(root_xml),
+                    label_name=label_name,
+                    shape_tag="box",
+                    resolve_same_frame=resolve,
+                    keep_attributes_from=keep_attrs,
+                )
+                if merged_root is None:
+                    st.error(msg)
+                else:
+                    merged_xml_bytes = _export_xml_bytes(merged_root)
+                    st.success(msg)
+                    if zip_mode and out_as_zip and tmpdir and zip_selected_path:
+                        zip_selected_path.write_bytes(merged_xml_bytes)
+                        out_zip = _rezip_folder_to_bytes(tmpdir)
+                        st.download_button("Download merged ZIP", data=out_zip, file_name="merged_cvat.zip", mime="application/zip")
                     else:
-                        st.success(msg)
-                        merged_xml_bytes = _export_xml_bytes(merged_root)
+                        st.download_button("Download XML", data=merged_xml_bytes, file_name="cvat_merge_singleframe.xml", mime="application/xml")
 
-                        if zip_mode and out_as_zip and tmpdir and zip_selected_path:
-                            zip_selected_path.write_bytes(merged_xml_bytes)
-                            out_zip = _rezip_folder_to_bytes(tmpdir)
-                            st.download_button(
-                                "Download merged ZIP",
-                                data=out_zip,
-                                file_name="merged_cvat.zip",
-                                mime="application/zip",
-                            )
-                        else:
-                            st.download_button(
-                                "Download merged CVAT Video XML",
-                                data=merged_xml_bytes,
-                                file_name=f"cvat_merge_singleframe_{label_name}.xml",
-                                mime="application/xml",
-                            )
 
 # ============================================================
-# Datumaro UI
+# Datumaro UI + NEW requested feature
 # ============================================================
 
 elif input_kind == "datumaro":
@@ -958,15 +984,89 @@ elif input_kind == "datumaro":
 
     label_map = datumaro_label_map(datumaro_data)
     all_label_names = sorted(set(label_map.values()))
-
     tracks = collect_datumaro_tracks(datumaro_data)
 
-    tabs = st.tabs(["Merge selected track_ids", "Merge ALL shapes into ONE track_id (whole task)"])
+    tabs = st.tabs([
+        "Assign untracked shapes → NEW track_id (safe for CVAT reupload)",
+        "Merge selected track_ids",
+        "Merge ALL into ONE track_id",
+    ])
 
+    # -------- NEW FEATURE TAB
     with tabs[0]:
+        st.subheader("Detect untracked shapes (no attributes.track_id) and assign them a NEW track_id")
+
+        label_choice = st.selectbox("Label/class", all_label_names, key="dm_untracked_label")
+
+        total_untracked, by_type = datumaro_count_untracked_for_label(datumaro_data, label_choice)
+        next_tid = datumaro_next_available_track_id(datumaro_data)
+
+        st.write(f"Untracked annotations for **{label_choice}**: **{total_untracked}**")
+        if by_type:
+            st.caption("Breakdown by annotation type:")
+            st.json(by_type)
+
+        st.info(f"Next available track_id (won’t interfere with existing tracks): **{next_tid}**")
+
+        # Type filtering option
+        all_types_for_label = sorted(by_type.keys()) if by_type else []
+        only_types = st.multiselect(
+            "Optional: only assign these types (leave empty = all untracked types)",
+            all_types_for_label,
+            default=[],
+            key="dm_untracked_types"
+        )
+
+        col1, col2, col3 = st.columns([2, 2, 2])
+        with col1:
+            set_group = st.checkbox("Set annotation.group = track_id", value=True, key="dm_untracked_group")
+        with col2:
+            add_instance_id = st.checkbox("Add attributes.instance_id = track_id", value=True, key="dm_untracked_instance")
+        with col3:
+            use_custom = st.checkbox("Use custom track_id", value=False, key="dm_untracked_custom")
+
+        custom_tid = None
+        if use_custom:
+            custom_tid = st.number_input("Custom new track_id", min_value=0, value=int(next_tid), step=1, key="dm_untracked_custom_tid")
+
+        out_as_zip = False
+        if zip_mode:
+            out_as_zip = st.checkbox("Download result as ZIP (replace Datumaro JSON inside ZIP)", value=True, key="dm_untracked_zip_replace")
+
+        if st.button("Assign untracked → new track_id", type="primary", key="dm_untracked_btn"):
+            if total_untracked == 0:
+                st.warning("No untracked shapes found for this label — nothing to do.")
+            else:
+                tgt = int(custom_tid) if use_custom else int(next_tid)
+                merged, used_tid, changed = datumaro_assign_untracked_shapes_to_new_track(
+                    deepcopy(datumaro_data),
+                    label_name=label_choice,
+                    new_track_id=tgt,
+                    set_group=set_group,
+                    add_instance_id=add_instance_id,
+                    only_types=only_types if only_types else None,
+                )
+                st.success(f"Assigned {changed} untracked annotations → track_id={used_tid} (label='{label_choice}').")
+
+                out_json = json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
+
+                if zip_mode and out_as_zip and tmpdir:
+                    dm_json_path, _ = _find_datumaro_json_in_dir(tmpdir)
+                    if dm_json_path is None:
+                        st.warning("Could not re-find Datumaro JSON to replace; downloading JSON instead.")
+                        st.download_button("Download merged Datumaro JSON", data=out_json, file_name="datumaro_assigned.json", mime="application/json")
+                    else:
+                        dm_json_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+                        out_zip = _rezip_folder_to_bytes(tmpdir)
+                        st.download_button("Download updated Datumaro ZIP", data=out_zip, file_name="datumaro_assigned.zip", mime="application/zip")
+                else:
+                    st.download_button("Download updated Datumaro JSON", data=out_json, file_name="datumaro_assigned.json", mime="application/json")
+
+    # -------- Merge selected track_ids
+    with tabs[1]:
         st.subheader("Merge selected track_ids within a label")
 
-        label_choice = st.selectbox("Label/class", all_label_names, key="dm_label_1")
+        label_choice = st.selectbox("Label/class", all_label_names, key="dm_merge_label_1")
 
         tid_options = []
         tid_lookup = {}
@@ -981,23 +1081,18 @@ elif input_kind == "datumaro":
                 tid_options.append(disp)
 
         if not tid_options:
-            st.warning("No track_id found for this label. Use the 'Merge ALL shapes' tab if you want to force one track_id.")
+            st.warning("No track_id found for this label (maybe everything is untracked). Use the first tab.")
         else:
-            selected_disps = st.multiselect(
-                "Select track_ids to merge",
-                tid_options,
-                default=tid_options[: min(3, len(tid_options))],
-                key="dm_tids_multi",
-            )
+            selected_disps = st.multiselect("Select track_ids to merge", tid_options, default=tid_options[: min(3, len(tid_options))])
             selected_tids = [tid_lookup[d] for d in selected_disps]
 
             colA, colB, colC = st.columns([2, 2, 2])
             with colA:
-                target_mode = st.radio("Target track_id", ["Use smallest selected", "Enter manually"], horizontal=True)
+                target_mode = st.radio("Target track_id", ["Use smallest selected", "Enter manually"], horizontal=True, key="dm_target_mode")
             with colB:
-                set_group = st.checkbox("Unify 'group' to target track_id", value=True)
+                set_group = st.checkbox("Unify 'group' to target track_id", value=True, key="dm_set_group")
             with colC:
-                add_instance_id = st.checkbox("Add attributes.instance_id = target track_id", value=True)
+                add_instance_id = st.checkbox("Add attributes.instance_id = target track_id", value=True, key="dm_add_instance")
 
             target_tid = None
             if target_mode == "Enter manually":
@@ -1028,74 +1123,12 @@ elif input_kind == "datumaro":
                     out_json = json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
 
                     if zip_mode and out_as_zip and tmpdir:
-                        # replace the first Datumaro JSON we found
                         dm_json_path, _ = _find_datumaro_json_in_dir(tmpdir)
                         if dm_json_path is None:
-                            st.warning("Could not re-find Datumaro JSON to replace; downloading JSON instead.")
                             st.download_button("Download merged Datumaro JSON", data=out_json, file_name="merged_datumaro.json", mime="application/json")
                         else:
                             dm_json_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
                             out_zip = _rezip_folder_to_bytes(tmpdir)
                             st.download_button("Download merged Datumaro ZIP", data=out_zip, file_name="merged_datumaro.zip", mime="application/zip")
                     else:
-                        st.download_button("Download merged Datumaro JSON", data=out_json, file_name="merged_datumaro.json", mime="application/json")
-
-    with tabs[1]:
-        st.subheader("Merge ALL shapes of a label into ONE track_id (whole task)")
-
-        label_choice2 = st.selectbox("Label/class", all_label_names, key="dm_label_2")
-
-        col1, col2, col3 = st.columns([2, 2, 2])
-        with col1:
-            target_track_id = st.number_input("Target track_id", min_value=0, value=0, step=1, key="dm_all_target")
-        with col2:
-            force_add_track_id = st.checkbox("If an annotation lacks track_id, add it", value=True, key="dm_all_force")
-        with col3:
-            set_group2 = st.checkbox("Unify 'group' to target track_id", value=True, key="dm_all_group")
-
-        col4, col5 = st.columns([2, 2])
-        with col4:
-            add_instance_id2 = st.checkbox("Add attributes.instance_id = target track_id", value=True, key="dm_all_instance")
-        with col5:
-            reindex_ids2 = st.checkbox("Reindex annotation 'id' fields (unique 0..N-1)", value=False, key="dm_all_reindex")
-
-        out_as_zip = False
-        if zip_mode:
-            out_as_zip = st.checkbox("Download result as ZIP (replace Datumaro JSON inside ZIP)", value=True, key="dm_zip_replace_2")
-
-        if st.button("Merge ALL shapes into ONE track_id", type="primary"):
-            merged, changed = datumaro_merge_all_shapes_to_one_track(
-                deepcopy(datumaro_data),
-                label_name=label_choice2,
-                target_track_id=int(target_track_id),
-                force_add_track_id=force_add_track_id,
-                set_group=set_group2,
-                add_instance_id=add_instance_id2,
-                reindex_annotation_ids=reindex_ids2,
-            )
-            st.success(f"Updated {changed} annotations: all '{label_choice2}' → track_id={int(target_track_id)} across the dataset.")
-
-            out_json = json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
-
-            if zip_mode and out_as_zip and tmpdir:
-                dm_json_path, _ = _find_datumaro_json_in_dir(tmpdir)
-                if dm_json_path is None:
-                    st.warning("Could not re-find Datumaro JSON to replace; downloading JSON instead.")
-                    st.download_button("Download merged Datumaro JSON", data=out_json, file_name="merged_datumaro.json", mime="application/json")
-                else:
-                    dm_json_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-                    out_zip = _rezip_folder_to_bytes(tmpdir)
-                    st.download_button("Download merged Datumaro ZIP", data=out_zip, file_name="merged_datumaro.zip", mime="application/zip")
-            else:
-                st.download_button("Download merged Datumaro JSON", data=out_json, file_name="merged_datumaro.json", mime="application/json")
-
-
-# ============================================================
-# Cleanup zip temp dir
-# ============================================================
-
-if tmpdir is not None:
-    try:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-    except Exception:
-        pass
+                        st.download_button_
